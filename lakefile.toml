@@ -2,11 +2,6 @@ name = "hex-bareiss"
 defaultTargets = ["HexBareiss"]
 
 [[require]]
-name = "batteries"
-git = "https://github.com/leanprover-community/batteries.git"
-rev = "v4.30.0-rc2"
-
-[[require]]
 name = "HexDeterminant"
 git = "https://github.com/kim-em/hex-determinant.git"
 rev = "2b8a673897668d6368819a83f24418cbd3fedb2b"
