@@ -1,0 +1,19 @@
+name = "hex-bareiss-conformance"
+defaultTargets = ["HexBareissConformance", "hexbareiss_emit_fixtures"]
+
+[[require]]
+name = "HexBareiss"
+path = ".."
+
+[[require]]
+name = "hex-test-kit"
+git = "https://github.com/kim-em/hex-test-kit.git"
+rev = "597e6a3b68807ef0fdf23ba3f6ae31549124ce23"
+
+[[lean_lib]]
+name = "HexBareissConformance"
+globs = ["HexBareiss.Conformance"]
+
+[[lean_exe]]
+name = "hexbareiss_emit_fixtures"
+root = "HexBareiss.EmitFixtures"
