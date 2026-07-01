@@ -9,7 +9,7 @@ rev = "f1580d28c2e9ff9e8d4d7cdef9dccbaa17780b03"
 [[require]]
 name = "HexDeterminant"
 git = "https://github.com/kim-em/hex-determinant.git"
-rev = "0afc5bac5033aeb453fc873dcf043e216011a72e"
+rev = "8ce401452f1cfcf714d46887440d7d4341177818"
 
 [[lean_lib]]
 name = "HexBareiss"
