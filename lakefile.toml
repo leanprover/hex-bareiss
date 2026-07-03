@@ -9,7 +9,7 @@ rev = "f1580d28c2e9ff9e8d4d7cdef9dccbaa17780b03"
 [[require]]
 name = "HexDeterminant"
 git = "https://github.com/leanprover/hex-determinant.git"
-rev = "b72a8d00388501d203aea57152ed211952412c96"
+rev = "3d6cef2a31a718debcf20c78124f81e2c19ced75"
 
 [[lean_lib]]
 name = "HexBareiss"
