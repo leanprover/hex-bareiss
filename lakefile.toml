@@ -9,12 +9,12 @@ leanOptions = [
 [[require]]
 name = "HexBasic"
 git = "https://github.com/leanprover/hex-basic.git"
-rev = "591c146eeee0ef301a110cd33c19cc0cf1e07352"
+rev = "2d7f55d190cc2df9c9bf55437f344e65fbddc7c0"
 
 [[require]]
 name = "HexDeterminant"
 git = "https://github.com/leanprover/hex-determinant.git"
-rev = "fe179e0a2b9d42ef50617df00de3f91fc7f2d013"
+rev = "b9b21e295175885e2ee20728c8f8a13d00e36124"
 
 [[lean_lib]]
 name = "HexBareiss"
