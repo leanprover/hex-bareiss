@@ -9,6 +9,10 @@ module
 public import HexBareiss.Bareiss
 public import HexArith.ExactDiv
 public import HexMatrix.Notation
+public import HexMatrix.Packed
+public import HexMatrix.Lists
+public meta import HexMatrix.Lists
+meta import HexMatrix.Packed
 
 public section
 
@@ -61,19 +65,21 @@ matrix equals the value) is in `HexBareissMathlib`.
 namespace Hex.Matrix
 
 /-- A kernel-checkable determinant certificate.  See the module docstring. -/
-inductive DetWitness where
+inductive DetWitness (R : Type := Int) where
   /-- A triangularization: the row swaps in application order, the rows of the
   lower triangular transform (row `i` holds its `i + 1` leading entries), and
   the value. -/
-  | triangular (swaps : List (Nat × Nat)) (transform : List (List Int)) (value : Int)
+  | triangular (swaps : List (Nat × Nat)) (transform : List (List R)) (value : R)
   /-- A nonzero left kernel vector: the value is `0`. -/
-  | singular (vec : List Int)
+  | singular (vec : List R)
   deriving Repr, Inhabited, DecidableEq
 
 namespace DetWitness
 
+open Packed (dotInt column columns)
+
 /-- The certified value. -/
-@[expose] def value : DetWitness → Int
+@[expose] def value [Zero R] : DetWitness R → R
   | .triangular _ _ d => d
   | .singular _ => 0
 
@@ -126,24 +132,6 @@ each step in a bounded number of unfoldings. -/
   | [] => true
   | r :: rs => Nat.beq r.length m && rowsLen m rs
 
-/-- The dot product of two integer lists, stopping at the shorter. -/
-@[expose] def dotInt : List Int → List Int → Int
-  | a :: as, b :: bs => Int.add (Int.mul a b) (dotInt as bs)
-  | _, _ => 0
-
-/-- Column `j` of a row list. -/
-@[expose] def column (j : Nat) : List (List Int) → List Int
-  | [] => []
-  | r :: rs => nthInt r j :: column j rs
-
-/-- Columns `j, …, j + k - 1` of a row list. -/
-@[expose] def columnsFrom (A : List (List Int)) (j : Nat) : Nat → List (List Int)
-  | 0 => []
-  | k + 1 => column j A :: columnsFrom A (j + 1) k
-
-/-- The `m` columns of a row list. -/
-@[expose] def columns (m : Nat) (A : List (List Int)) : List (List Int) := columnsFrom A 0 m
-
 /-- The row is orthogonal to every column in the list. -/
 @[expose] def zeroDots (t : List Int) : List (List Int) → Bool
   | [] => true
@@ -168,6 +156,35 @@ and at the end `pl · d = pu` is required. -/
       Nat.beq t.length (i + 1) && !(decide (l = 0)) && zeroDots t done &&
         triangularCheck d (c :: done) (i + 1) ts cs (Int.mul pl l) (Int.mul pu (dotInt t c))
   | _, _, _, _, _, _ => false
+
+/-! # Packed evaluation
+
+The triangularization's dot products on Kronecker-packed rows
+(`Hex.Matrix.Packed`): a signed row is the pair of its packed nonnegative
+and negated nonpositive parts, and a dot product is four packed products
+combined, one multiplication, shift and mask each in the kernel instead of
+`i` multiply-adds of minor-sized integers.  Exactness needs every entry of
+the transform and of the matrix below `k` in absolute value and
+`n · k² < 2^W`, which `checkDetListPacked` verifies. -/
+
+/-- `zeroDots` on packed pairs. -/
+@[expose] def zeroDotsPacked (W r : Nat) (t : Nat × Nat) : List (Nat × Nat) → Bool
+  | [] => true
+  | c :: cs => decide (Packed.dotIntPacked W r t c = 0) && zeroDotsPacked W r t cs
+
+/-- `triangularCheck` with the dot products on packed pairs: `tps` the packed
+rows of the transform alongside its rows `ts`, `done` and `cs` the packed
+columns. -/
+@[expose] def triangularCheckPacked (W r : Nat) (d : Int) :
+    List (Nat × Nat) → Nat → List (List Int) → List (Nat × Nat) → List (Nat × Nat) → Int → Int →
+      Bool
+  | _, _, [], [], [], pl, pu => decide (Int.mul pl d = pu)
+  | done, i, t :: ts, tp :: tps, c :: cs, pl, pu =>
+      let l := nthInt t i
+      Nat.beq t.length (i + 1) && !(decide (l = 0)) && zeroDotsPacked W r tp done &&
+        triangularCheckPacked W r d (c :: done) (i + 1) ts tps cs (Int.mul pl l)
+          (Int.mul pu (Packed.dotIntPacked W r tp c))
+  | _, _, _, _, _, _, _ => false
 
 /-! # Rational rows
 
@@ -203,10 +220,36 @@ kernel vector; see the module docstring. -/
 @[expose] def checkDetList (n : Nat) (A : List (List Int)) : DetWitness → Bool
   | .triangular swaps T d =>
       Nat.beq A.length n && rowsLen n A && swapsOk n swaps &&
-        triangularCheck d [] 0 T (columns n (applySwaps swaps A)) 1 (signOf swaps)
+        triangularCheck d [] 0 T (Packed.columns n (applySwaps swaps A)) 1 (signOf swaps)
   | .singular v =>
       Nat.beq A.length n && rowsLen n A && Nat.beq v.length n && anyNonzero v &&
-        zeroDots v (columns n A)
+        zeroDots v (Packed.columns n A)
+
+open DetWitness in
+/-- The kernel checker with the triangularization on packed rows, slot width
+`W` and entry bound `k`: `checkDetList` with `triangularCheck` replaced by
+`triangularCheckPacked`, plus the bounds that make the packed dot products
+exact: every entry of the matrix and of the transform below `k` in absolute
+value, `k > 0`, and `n · k² < 2^W`.  The singular branch is unchanged.  A
+passing packed check implies a passing `checkDetList`; see the companion's
+`checkDetList_of_packed`. -/
+@[expose] def checkDetListPacked (W k n : Nat) (A : List (List Int)) : DetWitness → Bool
+  | .triangular swaps T d =>
+      Nat.beq A.length n && rowsLen n A && swapsOk n swaps &&
+        Nat.blt 0 k && Packed.allAbsLtRows k A && Packed.allAbsLtRows k T &&
+        Nat.blt (Nat.mul n (Nat.mul k k)) (Nat.pow 2 W) &&
+        triangularCheckPacked W n d [] 0 T (Packed.packSignedRows W n T)
+          (Packed.packSignedCols W n (Packed.columns n (applySwaps swaps A))) 1 (signOf swaps)
+  | .singular v =>
+      Nat.beq A.length n && rowsLen n A && Nat.beq v.length n && anyNonzero v &&
+        zeroDots v (Packed.columns n A)
+
+open DetWitness in
+/-- `checkDetRat` with the packed integer check. -/
+@[expose] def checkDetRatPacked (W k n : Nat) (A : List (List Rat)) (s : List Nat)
+    (B : List (List Int)) (c : DetWitness) (v : Rat) : Bool :=
+  Nat.beq A.length n && Nat.beq s.length n && scaledRows s A B && checkDetListPacked W k n B c &&
+    decide (Rat.mul v (Rat.ofInt (Int.ofNat (prodNat s))) = Rat.ofInt c.value)
 
 open DetWitness in
 /-- The kernel checker for a rational matrix `A` given as `n` rows: the
@@ -221,33 +264,31 @@ scales `s` take the rows of `A` to the rows of the integer matrix `B`, which
 
 variable {n : Nat}
 
-/-- The rows of a square matrix as lists. -/
-def rowLists (A : Matrix Int n n) : List (List Int) := A.rows.toList.map (·.toList)
-
 namespace DetWitness
 
 /-- The state of the elimination on `[A | I]`: the current left block, the
 current right block, the original index of each current row, the swaps so
 far (reversed), the previous pivot, and the number of pivots found. -/
-private structure Elim where
-  left : Array (Array Int)
-  right : Array (Array Int)
+private structure Elim (R : Type) where
+  left : Array (Array R)
+  right : Array (Array R)
   perm : Array Nat
   swaps : List (Nat × Nat)
-  prev : Int
+  prev : R
   pivots : Nat
 
 /-- The first row at or below `r` with a nonzero entry in column `c`. -/
-private def findPivot (M : Array (Array Int)) (r c : Nat) : Option Nat :=
+private def findPivot [Zero R] [Inhabited R] [DecidableEq R] (M : Array (Array R)) (r c : Nat) : Option Nat :=
   (List.range (M.size - r)).findSome? fun k =>
     let i := r + k
     if M[i]![c]! != 0 then some i else none
 
 /-- One fraction-free step: the pivot in column `c` is moved to row `r` and
 rows below `r` are eliminated in both blocks. -/
-private def step (e : Elim) (c : Nat) : Elim :=
+private def step [Zero R] [Inhabited R] [DecidableEq R] [Sub R] [Mul R]
+    (quot : R → R → R) (e : Elim R) (c : Nat) (pivot : Option Nat) : Elim R :=
   let r := e.pivots
-  match findPivot e.left r c with
+  match pivot with
   | none => e
   | some i =>
     let e := if i = r then e else
@@ -256,18 +297,19 @@ private def step (e : Elim) (c : Nat) : Elim :=
     let p := e.left[r]![c]!
     let pivotL := e.left[r]!
     let pivotR := e.right[r]!
-    let update (M : Array (Array Int)) (pivotRow : Array Int) : Array (Array Int) :=
+    let update (M : Array (Array R)) (pivotRow : Array R) : Array (Array R) :=
       (List.range M.size).foldl (init := M) fun M i =>
         if i ≤ r then M else
           let f := e.left[i]![c]!
-          M.set! i <| (M[i]!).zipWith (fun x y => HexArith.Int.exactDiv (p * x - f * y) e.prev) pivotRow
+          M.set! i <| (M[i]!).zipWith (fun x y => quot (p * x - f * y) e.prev) pivotRow
     { e with left := update e.left pivotL, right := update e.right pivotR, prev := p,
              pivots := r + 1 }
 
 /-- The witness assembled from a finished elimination. -/
-private def assemble (n : Nat) (e : Elim) : DetWitness :=
+private def assemble [Zero R] [One R] [Neg R] [Mul R] [Inhabited R]
+    (n : Nat) (e : Elim R) : DetWitness R :=
   if e.pivots = n then
-    let sign : Int := if e.swaps.length % 2 = 0 then 1 else -1
+    let sign : R := if e.swaps.length % 2 = 0 then 1 else -1
     let transform := (List.range n).map fun i =>
       (List.range (i + 1)).map fun k => e.right[i]![e.perm[k]!]!
     let last := if n = 0 then 1 else e.left[n - 1]![n - 1]!
@@ -277,21 +319,146 @@ private def assemble (n : Nat) (e : Elim) : DetWitness :=
 
 end DetWitness
 
-open DetWitness in
-/-- The kernel witness of a square integer matrix given as `n` rows of length
-`n`, by fraction-free elimination on `[A | I]`, or the reason its own check
-fails. -/
-def detWitnessOfLists (n : Nat) (A : List (List Int)) : Except String DetWitness := do
+namespace DetWitness
+
+/-- Independent limits on current elimination blocks and the emitted witness. -/
+structure Budget where
+  maxIntermediate : Nat
+  maxCertificate : Nat
+  deriving Repr, BEq
+
+inductive Limit where
+  | intermediate
+  | certificate
+  deriving Repr, BEq
+
+/-- Resource declines remain distinct from malformed input or a rejected witness. -/
+inductive Error where
+  | exhausted (budget : Limit) (count limit : Nat)
+  | malformed (dimension : Nat)
+  | rejected
+  deriving Repr, BEq
+
+def Error.message : Error → String
+  | .exhausted budget count limit =>
+    let name := match budget with | .intermediate => "intermediate" | .certificate => "certificate"
+    s!"{name} budget exhausted (count {count}, limit {limit})"
+  | .malformed n => s!"the matrix is not {n} × {n}"
+  | .rejected => "the witness fails its own check"
+
+private def blockSize (size : R → Nat) (e : Elim R) : Nat :=
+  (e.left ++ e.right).foldl (fun total row => row.foldl (fun total x => total + size x) total) 0
+
+/-- Count the two products in every update, after the same swap as `step`. -/
+private def roundWork [Zero R] [Inhabited R] [DecidableEq R]
+    (size : R → Nat) (e : Elim R) (c : Nat) (pivot : Option Nat) : Nat := Id.run do
+  let r := e.pivots
+  let some i := pivot | return 0
+  let left := e.left.swapIfInBounds r i
+  let right := e.right.swapIfInBounds r i
+  let p := size left[r]![c]!
+  let mut count := 0
+  for j in [r + 1:left.size] do
+    let f := size left[j]![c]!
+    for (x, y) in left[j]!.zip left[r]! do
+      count := count + p * size x + f * size y
+    for (x, y) in right[j]!.zip right[r]! do
+      count := count + p * size x + f * size y
+  return count
+
+/-- Total serialized support, including the value in the triangular case. -/
+def measure (size : R → Nat) : DetWitness R → Nat
+  | .triangular _ rows d => rows.foldl (fun total row =>
+      row.foldl (fun total x => total + size x) total) (size d)
+  | .singular v => v.foldl (fun total x => total + size x) 0
+
+private def produce [Zero R] [One R] [Neg R] [Sub R] [Mul R]
+    [Inhabited R] [DecidableEq R] (quot : R → R → R) (n : Nat)
+    (size : R → Nat) (budget : Option Budget)
+    (A : List (List R)) : Except Error (DetWitness R) := do
   unless A.length = n ∧ A.all (·.length = n) do
-    throw s!"the matrix is not {n} × {n}"
-  let left : Array (Array Int) := (A.map (·.toArray)).toArray
-  let right : Array (Array Int) := (List.range n).toArray.map fun i =>
+    throw (.malformed n)
+  let left : Array (Array R) := (A.map (·.toArray)).toArray
+  let right : Array (Array R) := (List.range n).toArray.map fun i =>
     (List.range n).toArray.map fun j => if i = j then 1 else 0
-  let e : Elim := { left, right, perm := (List.range n).toArray, swaps := [], prev := 1, pivots := 0 }
-  let e := (List.range n).foldl step e
+  let mut e : Elim R := { left, right, perm := (List.range n).toArray, swaps := [], prev := 1, pivots := 0 }
+  for c in [:n] do
+    let pivot := findPivot e.left e.pivots c
+    if let some b := budget then
+      let count := blockSize size e + roundWork size e c pivot
+      if count > b.maxIntermediate then throw (.exhausted .intermediate count b.maxIntermediate)
+    e := step quot e c pivot
+    if let some b := budget then
+      let count := blockSize size e
+      if count > b.maxIntermediate then throw (.exhausted .intermediate count b.maxIntermediate)
   let w := assemble n e
-  if checkDetList n A w then pure w
-  else throw "the witness fails its own check"
+  if let some b := budget then
+    let count := w.measure size
+    if count > b.maxCertificate then throw (.exhausted .certificate count b.maxCertificate)
+  return w
+
+private def validate (check : DetWitness R → Bool)
+    (candidate : Except Error (DetWitness R)) : Except Error (DetWitness R) := do
+  let w ← candidate
+  if check w then return w else throw .rejected
+
+private theorem validate_check (check : DetWitness R → Bool)
+    (candidate : Except Error (DetWitness R)) (w : DetWitness R)
+    (h : validate check candidate = .ok w) : check w = true := by
+  cases candidate with
+  | error e => simp [validate, bind, Except.bind] at h
+  | ok v =>
+    simp only [validate, bind, Except.bind] at h
+    split at h
+    · cases h; assumption
+    · contradiction
+
+end DetWitness
+
+/-- Fraction-free production with operand admission, block support and witness
+limits. The final self-check runs only after the witness fits its budget. -/
+def detWitnessBudgeted [Zero R] [One R] [Neg R] [Sub R] [Mul R]
+    [Inhabited R] [DecidableEq R] (quot : R → R → R) (n : Nat)
+    (size : R → Nat) (budget : DetWitness.Budget)
+    (check : List (List R) → DetWitness R → Bool) (A : List (List R)) :
+    Except DetWitness.Error (DetWitness R) :=
+  DetWitness.validate (check A) (DetWitness.produce quot n size (some budget) A)
+
+theorem detWitnessBudgeted_check [Zero R] [One R] [Neg R] [Sub R] [Mul R]
+    [Inhabited R] [DecidableEq R] (quot : R → R → R) (n : Nat)
+    (size : R → Nat) (budget : DetWitness.Budget)
+    (check : List (List R) → DetWitness R → Bool) (A : List (List R))
+    (w : DetWitness R) (h : detWitnessBudgeted quot n size budget check A = .ok w) :
+    check A w = true := DetWitness.validate_check _ _ _ h
+
+/-- The unlimited instance of the same producer, retaining the integer API. -/
+def detWitnessWith [Zero R] [One R] [Neg R] [Sub R] [Mul R]
+    [Inhabited R] [DecidableEq R] (quot : R → R → R) (n : Nat)
+    (check : List (List R) → DetWitness R → Bool)
+    (A : List (List R)) : Except String (DetWitness R) :=
+  (DetWitness.validate (check A) (DetWitness.produce quot n (fun _ => 0) none A)).mapError
+    DetWitness.Error.message
+
+/-- Every successful producer return has passed its supplied checker. This
+does not assume the quotient implementation is correct: a rejected witness
+is returned as an error. -/
+theorem detWitnessWith_check {R : Type} [Zero R] [One R] [Neg R] [Sub R] [Mul R]
+    [Inhabited R] [DecidableEq R] (quot : R → R → R) (n : Nat)
+    (check : List (List R) → DetWitness R → Bool) (A : List (List R))
+    (w : DetWitness R) (h : detWitnessWith quot n check A = .ok w) :
+    check A w = true := by
+  unfold detWitnessWith at h
+  generalize he : DetWitness.validate (check A)
+    (DetWitness.produce quot n (fun _ => 0) none A) = result at h
+  cases result with
+  | error e => contradiction
+  | ok v =>
+    cases h
+    exact DetWitness.validate_check _ _ _ he
+
+/-- The integer instance of the generic witness producer. -/
+def detWitnessOfLists (n : Nat) (A : List (List Int)) : Except String DetWitness :=
+  detWitnessWith HexArith.Int.exactDiv n (checkDetList n) A
 
 /-- The kernel witness of a square integer matrix. -/
 def detWitness (A : Matrix Int n n) : Except String DetWitness :=

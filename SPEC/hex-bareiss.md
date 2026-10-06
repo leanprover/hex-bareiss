@@ -348,7 +348,12 @@ instead, and its value is `0`.
 2. the triangularization: the kernel arranges the rows itself
    (`applySwaps`, each swap two `replaceRow`s), reads the sign of the
    arrangement off the number of swaps, and transposes the arranged matrix
-   once (`columns`). For every row `i` of `L` it takes the products with
+   once (`columns`, one pass over the rows prepending each entry to its
+   column, `n²` list steps; not `n²` indexed reads of `O(index)` each,
+   which measured as much as the arithmetic on the dense `40 × 40` bench
+   matrix and most of the check on the singular one). For every row `i`
+   of `L` it takes
+   the products with
    the columns `0, …, i` of `σA`: the first `i` must vanish, and the last
    is the diagonal entry `uᵢ` of the upper triangular product `U = L · σA`
    (`triangularCheck`). Nothing above the diagonal of `U` is computed;
@@ -381,11 +386,165 @@ last entry is a product of pivots. The producer re-checks its own output
 with `checkDetList` and reports a failure as an error rather than
 returning a witness.
 
+### Packed evaluation
+
+`checkDetListPacked W k n A c` is `checkDetList` with the triangularization's
+dot products taken on Kronecker-packed rows, and `checkDetRatPacked` the
+same inside `checkDetRat`; they are the checkers the `det` tactic uses
+unless configured otherwise (`det -packing`). The certificate is unchanged
+and a passing packed check implies a passing plain check (the companion's
+`checkDetList_of_packed`, `checkDetRat_of_packed`), so the plain checkers
+remain the specification. The singular branch is the plain one: a left
+kernel vector against `n` columns gains nothing from packing after the
+one-pass transpose.
+
+The primitives are the shared `Hex.Matrix.Packed`
+([hex-matrix §Kronecker-packed dot products](../../HexMatrix/SPEC/hex-matrix.md#kronecker-packed-dot-products)).
+A signed row is the pair of its nonnegative parts and its negated
+nonpositive parts, each packed into one number with `W`-bit slots, cut or
+zero-padded to `n` entries (`packSignedCut` for the rows of `L`, reversed
+`packSignedCol` for the columns of `σA`), and a signed dot product is the
+four packed products of the parts combined (`dotIntPacked`:
+`t⁺·c⁺ + t⁻·c⁻ − t⁺·c⁻ − t⁻·c⁺`). `triangularCheckPacked` walks the rows of
+`L` as before, reading each row's length and last entry from the row list
+and its dot products from the packed pair, so the check does `n²/2`
+signed packed dot products in place of `n³/3` multiply-adds of
+minor-sized integers. Exactness needs every entry of `A` and of `L` below
+`k` in absolute value, `k > 0`, and `n · k² < 2^W`, which the checker
+verifies (`allAbsLtRows`); the tactic passes `k` one more than the
+largest absolute value it sees and the least positive `W` with
+`n · k² < 2^W`. On the dense `40 × 40` tactic-size bench matrix the kernel
+share of `det` measured `2.6 s` plain and `0.8 s` packed, on the
+`24 × 24` one `0.45 s` and `0.26 s`.
+
 The soundness theorems `det_eq_of_checkList` and `det_eq_of_checkRat`
 (`Matrix.det` of the Mathlib matrix of the row list equals the value) are
 on the forbidden list above and live in
 [hex-bareiss-mathlib §Kernel certificate](../../HexBareissMathlib/SPEC/hex-bareiss-mathlib.md#kernel-certificate);
 this layer states no equation between the certificate and a determinant.
+
+## Polynomial determinant certificate
+
+The native polynomial witness API generalises
+[§The kernel certificate](#the-kernel-certificate) over coefficient operations.
+[hex-poly-det](../../SPEC/Libraries/hex-poly-det.md) instantiates it at
+`MvPoly k C Hex.Mono.grevlex` using canonical polynomial lists and exact quotient
+operations. This is separate from the symbolic determinant tactic, which uses
+proved Bird evaluation and does not require a polynomial witness.
+
+**Placement.** Keep the dependency boundary of
+[§Placement in the dependency graph](#placement-in-the-dependency-graph).
+The witness and producer in hex-bareiss are generic over ring operations,
+equality and an exact quotient supplied by the caller; they do not import
+`HexMvGcd` or `HexMvPoly`. Likewise `checkDetPolyList` takes the canonical
+term-list operations as parameters, with soundness laws supplied only in
+the companion. hex-poly-det instantiates these generic executable definitions
+with hex-mv-poly's list arithmetic and hex-mv-gcd's polynomial quotient.
+No polynomial-specific public alias or division implementation is added to
+hex-bareiss, and its dependency list does not grow.
+
+**Producer and witness.** Generalise `detWitness` and its witness data over
+the coefficient type, preserving the integer API. The producer runs in compiled
+code, with the coefficient/order context of the `MvPoly` carrier contract
+below, including `LawfulGcdOps C`. It performs row-pivoted fraction-free
+elimination on `[P | I]`, applying each swap and each update
+`Hex.exactDiv (pivot * x - factor * y) previousPivot` to both blocks.
+`HexMvGcd/Divide.lean` supplies `Hex.MvPoly.instDiv` and
+`Hex.MvPoly.instExactDivLaws`; divisions are exact by the same minor invariant.
+The producer retains the transform and re-checks its output before returning
+it. Pivot search, polynomial normalisation and exact division are executable
+work, never kernel replay.
+
+`detWitnessBudgeted` in `HexBareiss/Kernel.lean` runs the same elimination
+with a caller-supplied size measure `R → Nat` and a two-field budget
+`DetWitness.Budget { maxIntermediate, maxCertificate : Nat }`. Before each
+column's step, the shared core selects the pivot once and accounts for the row
+swap when computing
+`∑ (size pivot * size x + size factor * size y)` over the entries updated
+in both blocks. A column with no pivot has no update cost. For polynomial
+support this counts the term products of the two multiplications and bounds
+the support of each exact division's dividend. Admit the round only when
+this count fits the remaining intermediate budget. After the round, charge
+the total measure of both current blocks and decline if it exceeds
+`maxIntermediate`; this block support is the meaning of an intermediate.
+The next round uses the budget remaining after that block charge, rather
+than accumulating charges for discarded blocks. This is an admission and
+retained-support policy, not a bound on the number of exact-division steps
+or on temporary supports inside an admitted arithmetic operation.
+
+Before running the final self-check, charge the witness's total measure
+(the transform and value, or the singular vector) against `maxCertificate`.
+Budget exhaustion returns structured data containing the budget name, count
+reached and limit; malformed matrices and rejected self-checks remain
+distinct failures in `DetWitness.Error`. Its exhaustion constructor is
+`exhausted (budget : DetWitness.Limit) (count limit : Nat)`, where `Limit`
+distinguishes `intermediate` and `certificate`. A decline carries no witness.
+`detWitnessBudgeted_check` proves that every `.ok` return passed the supplied
+checker, just as `detWitnessWith_check` does for the unlimited API.
+The unlimited `detWitnessWith` uses the same elimination core, computes no
+size measures, and retains its existing API and checker contract. No polynomial
+arithmetic or polynomial dependency is added to hex-bareiss. Consumers in
+hex-poly-det supply the support measure for integer and residue polynomials.
+
+For a nonsingular polynomial matrix the witness contains the row swaps, the
+`i + 1` leading polynomial entries of each lower triangular transform row,
+and a polynomial value `d = det P`. Here nonsingular means that `det P` is
+not the zero polynomial, equivalently invertibility over the fraction field
+of the polynomial domain. Singular means an identically zero determinant,
+not vanishing at a selected valuation. In that case echelon elimination
+returns a nonzero polynomial left kernel vector `v` with `v · P = 0` and
+value zero. Even though the fraction field describes singularity, every
+witness entry is in the polynomial ring. No specialisation is used to choose
+or certify the branch. The `0 × 0` witness is triangular with value one.
+
+**Kernel form.** `checkDetPolyList` is the polynomial analogue of
+`checkDetList`: the matrix, transform, value and singular vector are nested
+lists of canonical polynomial term lists. A term has an exponent list of
+length `k` and a coefficient in the provider's kernel representation (`Int`
+or canonical `Nat` residue). The check validates matrix/witness dimensions,
+swap bounds and distinctness, exponent lengths, strictly ordered monomials,
+nonzero coefficients and canonical coefficient encodings. Zero is the empty
+term list; duplicate monomials and stored zero terms are rejected. The list
+layer supplies structural addition, negation, multiplication, scalar
+multiplication and equality with denotation laws, and preserves canonicality.
+
+As in `checkDetList`, the checker itself applies the swaps and obtains their
+sign. For each row `i` of `L`, it checks that the first `i` products with
+columns of `σP` vanish, obtains `uᵢ` from column `i`, and requires the last
+entry `lᵢ` of the transform row to be nonzero. For `n > 0`,
+it checks `l₀ = 1`, `lᵢ₊₁ = uᵢ` for `i < n - 1`, and
+`d = sign σ * uₙ₋₁` by canonical list equality. These are the diagonal
+relations of this producer, already recorded for the integer witness above.
+The general determinant identity `(∏ lᵢ) * d = sign σ * ∏ uᵢ` follows
+in the soundness proof by cancellation; neither diagonal product is expanded
+in the kernel. Forming them would multiply supports of successive minors,
+far beyond the support of the determinant itself. For `n = 0` the checker
+requires `d = 1`. A singular witness instead checks a nonzero entry of `v` and every component of `v · P = 0`. The cost is
+about `n³ / 3` polynomial products for triangularisation and `n²` for a
+singular vector, plus canonicality and final value checks, at the realised
+minor support and coefficient sizes. There are no divisions in the checker.
+
+Every definition on the kernel arithmetic path is `@[expose]` and structurally
+recursive on lists of `Nat`/`Int`, per
+[matrix-tactics §Kernel discipline](../../SPEC/matrix-tactics.md#kernel-discipline).
+In particular converting reference polynomials to lists is producer work;
+the kernel receives quoted lists and does not traverse `MvPoly` trees or
+monomial vectors. A kernel-facing consumer must prove interpretation of its
+quoted rows and coefficient operations. Integer and natural-residue encodings
+use the canonical list operations supplied by hex-mv-poly. Any rational scaling
+consumer must prove its scaling factors and equality separately; it is not a
+required symbolic tactic route.
+
+The theorem `checkDetPolyList_sound`, concluding `Hex.Matrix.det P = d`
+through denotation, triangular determinant lemmas and cancellation over the
+polynomial domain, lives exclusively in hex-poly-det-mathlib
+([SPEC](../../SPEC/Libraries/hex-poly-det-mathlib.md)). The reference
+Leibniz determinant is a specification in that theorem, never kernel
+computation. This executable library adds no determinant correspondence
+theorem and never uses `bareissWith` or `det` on `Hex.Matrix (MvPoly …)` as
+a kernel check. Expression swell remains governed by
+[§Symbolic coefficient growth](#symbolic-coefficient-growth); operation counts
+do not promise bounded support or a timing win over Bird's algorithm.
 
 ## Mathlib-free vs. Mathlib-bridge proof surface
 
@@ -578,15 +737,14 @@ not be rewritten in the same change that could cause one.
 Add an internal A/B rung, `bareissWith Hex.exactDiv` at two sizes in the upper
 half of the existing ladder (the entries are multi-limb there, which is where
 `lean_int_div_exact` can differ), and record the ratio against the matching
-`runBareissDet` rung in `reports/hex-bareiss-performance.md`. This is an
-internal comparison, not an external comparator, so
-the existing `Int` entry in `HexBareiss.phase4.comparators` is unchanged.
+`runBareissDet` rung with the run's raw JSONL. This is an internal
+comparison, not an external comparator.
 
 Both rungs stay Mathlib-free and extend the script of the existing single
 bench job; no new workflow, job, or `strategy.matrix` (see
 [SPEC/CI.md](https://github.com/kim-em/hex-dev/blob/main/SPEC/CI.md)). If the
 two extra rungs push the `Bench verify` step past its wallclock cap, they belong
-on the scheduled timing workflow instead, per
+in manual scientific runs instead, per
 [SPEC/benchmarking.md](https://github.com/kim-em/hex-dev/blob/main/SPEC/benchmarking.md).
 
 Every added carrier also has a required lean-bench family. Scalar carriers
@@ -596,15 +754,16 @@ term count at fixed arity and total degree. Each family includes matrices whose
 second and later steps divide by a nonconstant previous pivot, so the benchmark
 measures exact division rather than only ring arithmetic.
 
-| target family | external comparator | class |
-|---|---|---|
-| `runBareissRat` | python-flint `fmpq_mat.det()` | informational |
-| `runBareissMod` | python-flint `nmod_mat.det()` at the identical prime | informational |
-| `runBareissDenseRat`, `runBareissDenseMod` | SymPy Berkowitz determinant over the identical exact polynomial domain | informational |
-| `runBareissZPoly` | SymPy Berkowitz determinant over `ZZ[x]` | informational |
-| `runBareissMvInt`, `runBareissMvRat` | SymPy Berkowitz determinant over the identical multivariate polynomial domain | informational |
+| target family | external comparator |
+|---|---|
+| `runBareissRat` | python-flint `fmpq_mat.det()` |
+| `runBareissMod` | python-flint `nmod_mat.det()` at the identical prime |
+| `runBareissDenseRat`, `runBareissDenseMod` | SymPy Berkowitz determinant over the identical exact polynomial domain |
+| `runBareissZPoly` | SymPy Berkowitz determinant over `ZZ[x]` |
+| `runBareissMvInt`, `runBareissMvRat` | SymPy Berkowitz determinant over the identical multivariate polynomial domain |
 
-All external comparisons are informational, never Phase-4 gates. FLINT's
+These external comparisons are orientation only; no performance target is set
+against them. FLINT's
 determinant selection is structurally different from the prescribed Bareiss
 recurrence, while the SymPy calls additionally include Python process overhead
 and independent algorithm selection. Result hashes cover the full canonical
@@ -614,11 +773,9 @@ The SymPy and python-flint registrations use a persistent-subprocess carrier
 driver, following `Hex.BenchOracle.Flint`. Because process-call benchmarks have
 an `IO` body, every point in a dimension/degree or dimension/term-count sweep
 is a separate `setup_fixed_benchmark`; there is no two-dimensional parametric
-`Nat → IO α` registration. The implementation PR records trivial-request
-overhead and overhead-adjusted ratios in
-`reports/hex-bareiss-performance.md §Comparator ratios`. These informational
-external rungs are scheduled-only; the matching Hex registrations still build
-and verify in the ordinary bench target.
+`Nat → IO α` registration. These external rungs run only in manual
+scientific runs; the matching Hex registrations still build and verify in the
+ordinary bench target.
 
 Over a field, Bareiss is primarily a conformance surface: fraction-free
 elimination buys no denominator control there and should not be inferred to be
@@ -642,23 +799,20 @@ silently substitutes one of them for Bareiss.
 
 ## External comparators
 
-| Comparator | Class | Scope |
-|---|---|---|
-| FLINT `fmpz_mat_det` via python-flint | informational | the `Int` Bareiss determinant targets (`runBareissDet` and the paired FLINT rungs) |
-| FLINT `fmpq_mat.det` via python-flint | informational | `runBareissRat` |
-| FLINT `nmod_mat.det` via python-flint | informational | `runBareissMod` |
-| SymPy Berkowitz exact-domain determinant | informational | the dense- and multivariate-polynomial Bareiss targets |
+| Comparator | Scope |
+|---|---|
+| FLINT `fmpz_mat_det` via python-flint | the `Int` Bareiss determinant targets (`runBareissDet` and the paired FLINT rungs) |
+| FLINT `fmpq_mat.det` via python-flint | `runBareissRat` |
+| FLINT `nmod_mat.det` via python-flint | `runBareissMod` |
+| SymPy Berkowitz exact-domain determinant | the dense- and multivariate-polynomial Bareiss targets |
 
 FLINT's `fmpz_mat_det` is a structurally distinct reference for integer matrix
 determinant: FLINT uses multimodular reduction (determinant modulo many small
 primes, then CRT), with a different asymptotic and constant-factor profile from
-Bareiss fraction-free elimination. The comparator is `informational`: the ratio
-is recorded for orientation but is not a Phase-4 gate. Wired via a
+Bareiss fraction-free elimination, so the ratio is orientation, not a
+performance target. Wired via a
 persistent-subprocess Python driver per
 [the benchmarking spec's "External comparators" section](https://github.com/kim-em/hex-dev/blob/main/SPEC/benchmarking.md#external-comparators).
 
-Structured metadata in the project
-[`libraries.yml`](https://github.com/kim-em/hex-dev/blob/main/libraries.yml)
-under `HexBareiss.phase4.comparators` records the carrier-scoped additions when
-their implementation lands. See
-`reports/hex-bareiss-performance.md` for the comparator ratio ladder.
+See `reports/hex-bareiss-performance.md` for a recorded comparator ratio
+ladder.
